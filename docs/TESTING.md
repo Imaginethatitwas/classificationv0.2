@@ -14,10 +14,11 @@ python scripts/smoke_test.py
 
 The script performs the following checks:
 
-1. Calls `classification.pipeline.process_path` on the sample batch with `min_views=0` so that all sample clips are processed.
-2. Verifies that four classification results are returned.
-3. Confirms that the resolved categories span the expected set (`Good`, `Bad`, `Tea`, `WeirdTea`) and that the emergent flags (e.g., `SafetyOverride`, `Disturbing`) appear where appropriate.
-4. Writes temporary artefacts (JSONL/CSV) and validates that the metrics file contains at least one bucket with top-video entries.
+1. Builds a temporary batch with a duplicate `aweme_id` and runs `classification-curate` programmatically to ensure the curation step keeps the highest-view snapshot while discarding lower-view duplicates.
+2. Calls `classification.pipeline.process_path` on the curated output with `min_views=0` so that all sample clips are processed.
+3. Verifies that four classification results are returned.
+4. Confirms that the resolved categories span the expected set (`good`, `bad`, `tea`, `tea_weird`) and that no unexpected flags are emitted.
+5. Writes temporary artefacts (JSONL/CSV) and validates that the metrics file contains at least one bucket with top-video entries.
 
 The script prints a concise summary and exits with status code 0 on success. Any assertion failure indicates a regression in either the detectors or the logic layer.
 
@@ -26,6 +27,10 @@ The script prints a concise summary and exits with status code 0 on success. Any
 Once the smoke test passes, run the full pipeline on a recent curated batch from S3:
 
 ```bash
+classification-curate s3://your-bucket/raw/ \
+  s3://your-bucket/curated/acceptances_full/ \
+  --min-views 50000 --overwrite
+
 classification-pipeline s3://your-bucket/curated/acceptances_full/ \
   --output ./outputs \
   --min-views 50000

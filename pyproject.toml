@@ -15,3 +15,4 @@ dependencies = [
 
 [project.scripts]
 classification-pipeline = "classification.cli:main"
+classification-curate = "classification.cli_curate:main"

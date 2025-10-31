@@ -14,8 +14,9 @@ provides:
 * Aggregation helpers that collapse classified videos into 15-minute
   market buckets and capture the top three clips per bucket for
   traceability.
-* A CLI (`classification-pipeline`) that ties the pieces together and
-  writes both the classification results and aggregated metrics to disk.
+* Two CLIs: `classification-curate` prepares the deduplicated
+  `acceptances_full` batches directly from S3, and `classification-pipeline`
+  classifies those curated records and emits the analytics artefacts.
 
 ## Quick start
 
@@ -25,8 +26,18 @@ Install the package in editable mode:
 python -m pip install -e .
 ```
 
-Run the pipeline over a directory of curated JSON/CSV exports (local paths or
-an S3 prefix/object):
+First, curate the raw scrapes into a deduplicated dataset. The command keeps
+the highest-view snapshot per `aweme_id`, drops clips below the threshold, and
+writes the enriched payloads back to disk or S3:
+
+```bash
+classification-curate s3://your-bucket/raw/ \ 
+  s3://your-bucket/curated/acceptances_full/ \ 
+  --min-views 50000 --overwrite
+```
+
+Then run the classifier over the curated dataset (local paths or S3
+prefix/object):
 
 ```bash
 classification-pipeline ./path/to/acceptances_full --output ./outputs --min-views 50000

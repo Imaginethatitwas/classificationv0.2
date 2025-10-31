@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, List, Sequence
 
 from .aggregator import aggregate, write_bucket_metrics
+from .curation import deduplicate_records
 from .data import ClassificationResult, VideoRecord
 from .detectors import detect_signals
 from .io import load_records
@@ -29,7 +30,8 @@ def process_path(
     records = load_records(source)
     resolver = resolver or ConflictResolver()
 
-    filtered_records = [record for record in records if record.view_count >= min_views]
+    deduped_records = deduplicate_records(records)
+    filtered_records = [record for record in deduped_records if record.view_count >= min_views]
     results = _classify_records(filtered_records, resolver)
 
     if output_dir:

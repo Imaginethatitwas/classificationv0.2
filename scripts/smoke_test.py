@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -13,6 +14,7 @@ from tempfile import TemporaryDirectory
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from classification.curation import curate
 from classification.pipeline import process_path
 
 EXPECTED = {
@@ -24,12 +26,39 @@ EXPECTED = {
 
 
 def main() -> None:
-    sample_path = Path(__file__).resolve().parents[1] / "examples" / "sample_batch.json"
+    root = Path(__file__).resolve().parents[1]
+    sample_path = root / "examples" / "sample_batch.json"
     if not sample_path.exists():
         raise SystemExit(f"Sample batch not found at {sample_path}")
 
     with TemporaryDirectory() as tmpdir:
-        results = process_path(sample_path, tmpdir, min_views=0)
+        tmpdir_path = Path(tmpdir)
+
+        # Verify curation removes duplicates and keeps the highest view count
+        duplicate_payload = sample_path.read_text(encoding="utf-8")
+        duplicate_path = tmpdir_path / "duplicates.json"
+        duplicate_path.write_text(
+            duplicate_payload[:-2]
+            + ",\n  {\n    \"aweme_id\": \"1000000000000000002\",\n    \"desc\": \"Older snapshot with fewer views\",\n    \"create_time\": 1699990000,\n    \"statistics\": {\n      \"play_count\": 1000,\n      \"comment_count\": 1,\n      \"digg_count\": 1,\n      \"share_count\": 0\n    }\n  }\n]",
+            encoding="utf-8",
+        )
+
+        curated_path = tmpdir_path / "curated.json"
+        report = curate(duplicate_path, curated_path, min_views=0, overwrite=True)
+
+        if report.retained != 4 or report.duplicates_dropped == 0:
+            raise SystemExit("Curation did not retain the expected records")
+
+        curated_data = json.loads(curated_path.read_text(encoding="utf-8"))
+        if len(curated_data) != 4:
+            raise SystemExit("Curated output should contain four unique items")
+        view_counts = {
+            item["aweme_id"]: item["statistics"]["play_count"] for item in curated_data
+        }
+        if view_counts.get("1000000000000000002") != 125000:
+            raise SystemExit("Curation failed to keep the highest-view snapshot")
+
+        results = process_path(curated_path, tmpdir_path, min_views=0)
 
         if len(results) != len(EXPECTED):
             raise SystemExit(
@@ -49,7 +78,7 @@ def main() -> None:
                     f" expected {expected_flag}"
                 )
 
-        metrics_path = Path(tmpdir) / "bucket_metrics.csv"
+        metrics_path = tmpdir_path / "bucket_metrics.csv"
         if not metrics_path.exists():
             raise SystemExit("bucket_metrics.csv was not produced")
 
