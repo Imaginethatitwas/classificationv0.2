@@ -1,0 +1,220 @@
+"""Utilities for preparing TikTok aweme records for NLP processing."""
+
+from __future__ import annotations
+
+import csv
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Protocol, Sequence, Tuple
+
+Record = Dict[str, Any]
+
+# Column constants
+AWEME_ID_COLUMN = "aweme_id"
+PLAY_COUNT_COLUMN = "statistics.play_count"
+
+
+class QueuePublisher(Protocol):
+    """Protocol describing how processed rows are published to a queue."""
+
+    def publish(self, records: Iterable[Record]) -> None:
+        """Publish an iterable of dictionary records."""
+
+
+@dataclass
+class JsonlQueuePublisher:
+    """Simple queue publisher that appends JSONL rows to a file."""
+
+    destination: Path
+    append: bool = True
+
+    def publish(self, records: Iterable[Record]) -> None:  # pragma: no cover - simple wrapper
+        rows = list(records)
+        if not rows:
+            return
+
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if self.append and self.destination.exists() else "w"
+        with self.destination.open(mode, encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _ensure_required_columns(records: Sequence[Record]) -> None:
+    missing_columns = {AWEME_ID_COLUMN, PLAY_COUNT_COLUMN}
+    available = set().union(*(record.keys() for record in records)) if records else set()
+    missing = missing_columns - available
+    if missing:
+        missing_list = ", ".join(sorted(missing))
+        raise KeyError(f"Missing required columns: {missing_list}")
+
+
+def _to_int(value: Any) -> int:
+    if isinstance(value, bool):
+        raise TypeError("Boolean value cannot represent play count")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").replace("_", "").strip()
+        if not cleaned:
+            raise ValueError("Empty string cannot represent play count")
+        return int(float(cleaned))
+    raise TypeError(f"Unsupported type for numeric conversion: {type(value)!r}")
+
+
+def load_curated_table(path: Path | str) -> List[Record]:
+    """Load the curated dataset from CSV or JSON Lines files."""
+
+    resolved = Path(path)
+    if not resolved.exists():
+        raise FileNotFoundError(f"Curated table not found: {resolved}")
+
+    suffix = resolved.suffix.lower()
+    if suffix == ".csv":
+        with resolved.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            records = [dict(row) for row in reader]
+    elif suffix in {".jsonl", ".ndjson"}:
+        with resolved.open("r", encoding="utf-8") as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+    else:
+        raise ValueError(
+            "Unsupported file extension for curated table: " f"{resolved.suffix}"
+        )
+
+    _ensure_required_columns(records)
+    for record in records:
+        record[PLAY_COUNT_COLUMN] = _to_int(record[PLAY_COUNT_COLUMN])
+    return records
+
+
+def select_top_aweme_by_play_count(records: Sequence[Record]) -> List[Record]:
+    """Select a single row per aweme with the maximum play count."""
+
+    if not records:
+        return []
+
+    _ensure_required_columns(records)
+    best_records: Dict[str, Record] = {}
+    for record in records:
+        aweme_id = record[AWEME_ID_COLUMN]
+        play_count = _to_int(record[PLAY_COUNT_COLUMN])
+        existing = best_records.get(aweme_id)
+        if existing is None or play_count > _to_int(existing[PLAY_COUNT_COLUMN]):
+            best_records[aweme_id] = dict(record)
+
+    deduplicated = list(best_records.values())
+    deduplicated.sort(key=lambda row: (-_to_int(row[PLAY_COUNT_COLUMN]), row[AWEME_ID_COLUMN]))
+    return deduplicated
+
+
+def partition_by_play_count(
+    records: Sequence[Record], *, threshold: int = 50_000
+) -> Tuple[List[Record], List[Record]]:
+    """Partition records into accepted and filtered groups by play count."""
+
+    if not records:
+        return [], []
+
+    _ensure_required_columns(records)
+    accepted: List[Record] = []
+    filtered: List[Record] = []
+
+    for record in records:
+        target = accepted if _to_int(record[PLAY_COUNT_COLUMN]) >= threshold else filtered
+        target.append(dict(record))
+
+    return accepted, filtered
+
+
+def _write_records(records: Sequence[Record], path: Path | str) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    suffix = destination.suffix.lower()
+
+    if suffix == ".csv":
+        fieldnames: List[str] = []
+        if records:
+            seen = set()
+            for record in records:
+                for key in record.keys():
+                    if key not in seen:
+                        seen.add(key)
+                        fieldnames.append(key)
+        with destination.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for record in records:
+                writer.writerow(record)
+    elif suffix in {".jsonl", ".ndjson"}:
+        with destination.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    else:
+        raise ValueError(
+            "Unsupported file extension for output: " f"{destination.suffix}"
+        )
+
+
+def process_curated_table(
+    input_path: Path | str,
+    *,
+    accepted_output: Path | str,
+    filtered_output: Path | str,
+    queue_publisher: QueuePublisher,
+    threshold: int = 50_000,
+) -> Tuple[List[Record], List[Record]]:
+    """Run the full processing pipeline for aweme records."""
+
+    curated = load_curated_table(input_path)
+    curated = select_top_aweme_by_play_count(curated)
+    accepted, filtered = partition_by_play_count(curated, threshold=threshold)
+
+    _write_records(accepted, accepted_output)
+    _write_records(filtered, filtered_output)
+
+    queue_publisher.publish(accepted)
+    return accepted, filtered
+
+
+def main() -> None:  # pragma: no cover - CLI wrapper
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input_path", type=Path, help="Path to the curated input table")
+    parser.add_argument(
+        "accepted_output",
+        type=Path,
+        help="Path where the accepted rows will be persisted",
+    )
+    parser.add_argument(
+        "filtered_output",
+        type=Path,
+        help="Path where the filtered rows (<threshold) will be persisted",
+    )
+    parser.add_argument(
+        "queue_path",
+        type=Path,
+        help="JSONL file acting as the NLP processing queue",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=50_000,
+        help="Minimum play count required to accept a record (default: 50k)",
+    )
+
+    args = parser.parse_args()
+    publisher = JsonlQueuePublisher(args.queue_path)
+    process_curated_table(
+        args.input_path,
+        accepted_output=args.accepted_output,
+        filtered_output=args.filtered_output,
+        queue_publisher=publisher,
+        threshold=args.threshold,
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    main()
