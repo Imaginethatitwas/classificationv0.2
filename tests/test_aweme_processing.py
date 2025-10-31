@@ -239,6 +239,58 @@ def test_load_curated_table_from_s3(monkeypatch):
     assert loaded == records
 
 
+def test_load_curated_table_from_directory(tmp_path: Path):
+    batch_dir = tmp_path / "curated"
+    batch_dir.mkdir()
+    csv_path = batch_dir / "part1.csv"
+    jsonl_path = batch_dir / "part2.jsonl"
+
+    csv_records = [
+        {AWEME_ID_COLUMN: "1", PLAY_COUNT_COLUMN: "10000", "caption": "first"},
+        {AWEME_ID_COLUMN: "2", PLAY_COUNT_COLUMN: "55000", "caption": "second"},
+    ]
+    jsonl_records = [
+        {AWEME_ID_COLUMN: "3", "statistics": {"play_count": 70_000}},
+    ]
+
+    _write_csv(csv_path, csv_records)
+    _write_jsonl(jsonl_path, jsonl_records)
+
+    loaded = aweme_processing.load_curated_table(batch_dir)
+
+    assert loaded == csv_records + jsonl_records
+
+
+def test_load_curated_table_from_s3_prefix(monkeypatch):
+    client = _FakeS3Client()
+
+    prefix = "input/curated/"
+    records_a = [
+        {AWEME_ID_COLUMN: "1", "statistics": {"play_count": 60_000}},
+    ]
+    records_b = [
+        {AWEME_ID_COLUMN: "2", "statistics": {"play_count": 80_000}},
+    ]
+    payload_a = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records_a)
+    payload_b = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records_b)
+
+    client.add_get_object(bucket="bucket", key=f"{prefix}part-0.jsonl", payload=payload_a)
+    client.add_get_object(bucket="bucket", key=f"{prefix}part-1.jsonl", payload=payload_b)
+
+    monkeypatch.setattr(aweme_processing, "_get_s3_client", lambda: client)
+    monkeypatch.setattr(
+        aweme_processing,
+        "_list_s3_keys",
+        lambda uri: [f"{prefix}part-0.jsonl", f"{prefix}part-1.jsonl"],
+    )
+
+    loaded = aweme_processing.load_curated_table("s3://bucket/input/curated/")
+
+    client.assert_no_pending()
+
+    assert loaded == records_a + records_b
+
+
 def test_process_curated_table_with_s3(monkeypatch):
     client = _FakeS3Client()
 

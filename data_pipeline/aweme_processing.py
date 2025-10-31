@@ -37,6 +37,8 @@ PLAY_COUNT_COLUMN = "statistics.play_count"
 PLAY_COUNT_NESTED_PARENT = "statistics"
 PLAY_COUNT_NESTED_CHILD = "play_count"
 
+SUPPORTED_SUFFIXES = {".csv", ".jsonl", ".ndjson"}
+
 
 class QueuePublisher(Protocol):
     """Protocol describing how processed rows are published to a queue."""
@@ -139,29 +141,64 @@ def load_curated_table(path: Path | str) -> List[Record]:
     """Load the curated dataset from CSV or JSON Lines files."""
 
     if _is_s3_path(path):
-        suffix = Path(_parse_s3_uri(str(path))[1]).suffix.lower()
-        raw_text = _read_text_from_s3(str(path))
-        records = _deserialise_records(raw_text, suffix)
+        uri = str(path)
+        bucket, key = _parse_s3_uri(uri)
+        suffix = Path(key).suffix.lower()
+        if suffix in SUPPORTED_SUFFIXES and not key.endswith("/"):
+            try:
+                raw_text = _read_text_from_s3(uri)
+            except FileNotFoundError:
+                records: List[Record] | None = None
+            else:
+                records = _deserialise_records(raw_text, suffix)
+                _ensure_required_columns(records)
+                return records
+        keys = _list_s3_keys(uri)
+        if not keys:
+            raise FileNotFoundError(f"No curated objects found under S3 prefix: {uri}")
+        records = []
+        for object_key in keys:
+            suffix = Path(object_key).suffix.lower()
+            if suffix not in SUPPORTED_SUFFIXES:
+                continue
+            object_uri = f"s3://{bucket}/{object_key}"
+            raw_text = _read_text_from_s3(object_uri)
+            records.extend(_deserialise_records(raw_text, suffix))
     else:
         resolved = Path(path)
         if not resolved.exists():
             raise FileNotFoundError(f"Curated table not found: {resolved}")
 
-        suffix = resolved.suffix.lower()
-        if suffix == ".csv":
-            with resolved.open("r", encoding="utf-8", newline="") as handle:
-                reader = csv.DictReader(handle)
-                records = [dict(row) for row in reader]
-        elif suffix in {".jsonl", ".ndjson"}:
-            with resolved.open("r", encoding="utf-8") as handle:
-                records = [json.loads(line) for line in handle if line.strip()]
-        else:
-            raise ValueError(
-                "Unsupported file extension for curated table: " f"{resolved.suffix}"
+        records: List[Record] = []
+        if resolved.is_dir():
+            files = sorted(
+                child
+                for child in resolved.rglob("*")
+                if child.is_file() and child.suffix.lower() in SUPPORTED_SUFFIXES
             )
+            if not files:
+                raise ValueError(
+                    f"Directory {resolved} does not contain supported curated files"
+                )
+            for file_path in files:
+                records.extend(_load_local_file(file_path))
+        else:
+            records = _load_local_file(resolved)
 
     _ensure_required_columns(records)
     return records
+
+
+def _load_local_file(path: Path) -> List[Record]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            return [dict(row) for row in reader]
+    if suffix in {".jsonl", ".ndjson"}:
+        with path.open("r", encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+    raise ValueError(f"Unsupported file extension for curated table: {path.suffix}")
 
 
 def select_top_aweme_by_play_count(records: Sequence[Record]) -> List[Record]:
@@ -285,6 +322,24 @@ def _parse_s3_uri(uri: str) -> Tuple[str, str]:
         raise ValueError(f"S3 URI is missing key: {uri}")
     key = parts[1]
     return bucket, key
+
+
+def _list_s3_keys(uri: str) -> List[str]:
+    bucket, key = _parse_s3_uri(uri)
+    prefix = key if key.endswith("/") else f"{key.rstrip('/')}/"
+    client = _get_s3_client()
+    paginator = client.get_paginator("list_objects_v2")
+    keys: List[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for item in page.get("Contents", []):
+            object_key = item.get("Key")
+            if not object_key or object_key.endswith("/"):
+                continue
+            suffix = Path(object_key).suffix.lower()
+            if suffix in SUPPORTED_SUFFIXES:
+                keys.append(object_key)
+    keys.sort()
+    return keys
 
 
 def _get_s3_client():
