@@ -50,10 +50,13 @@ def _write_csv(path: Path, records):
 def _read_csv(path: Path):
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        return [
-            {key: int(value) if key == PLAY_COUNT_COLUMN else value for key, value in row.items()}
-            for row in reader
-        ]
+        return [dict(row) for row in reader]
+
+
+def _write_jsonl(path: Path, records):
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def test_process_curated_table_writes_outputs(tmp_path: Path):
@@ -99,3 +102,53 @@ def test_process_curated_table_missing_columns(tmp_path: Path):
             filtered_output=tmp_path / "filtered.csv",
             queue_publisher=publisher,
         )
+
+
+def test_process_curated_table_preserves_full_json_record(tmp_path: Path):
+    raw_records = [
+        {
+            AWEME_ID_COLUMN: "1",
+            "statistics": {"play_count": 20_000, "digg_count": 15},
+            "desc": "low",
+            "author": {"uid": "a1", "nickname": "Alice"},
+        },
+        {
+            AWEME_ID_COLUMN: "1",
+            "statistics": {"play_count": 120_000, "digg_count": 70},
+            "desc": "high",
+            "author": {"uid": "a1", "nickname": "Alice"},
+            "extra": {"hashtags": ["fun", "dance"]},
+        },
+        {
+            AWEME_ID_COLUMN: "2",
+            "statistics": {"play_count": 55_000, "digg_count": 5},
+            "desc": "ok",
+        },
+    ]
+
+    input_path = tmp_path / "curated.jsonl"
+    accepted_path = tmp_path / "accepted.jsonl"
+    filtered_path = tmp_path / "filtered.jsonl"
+    queue_path = tmp_path / "queue.jsonl"
+
+    _write_jsonl(input_path, raw_records)
+
+    publisher = JsonlQueuePublisher(queue_path, append=False)
+
+    accepted, filtered = process_curated_table(
+        input_path,
+        accepted_output=accepted_path,
+        filtered_output=filtered_path,
+        queue_publisher=publisher,
+    )
+
+    with accepted_path.open("r", encoding="utf-8") as handle:
+        accepted_disk = [json.loads(line) for line in handle if line.strip()]
+    with filtered_path.open("r", encoding="utf-8") as handle:
+        filtered_disk = [json.loads(line) for line in handle if line.strip()]
+    with queue_path.open("r", encoding="utf-8") as handle:
+        queue_disk = [json.loads(line) for line in handle if line.strip()]
+
+    assert accepted_disk == accepted == [raw_records[1], raw_records[2]]
+    assert filtered_disk == filtered == []
+    assert queue_disk == accepted_disk

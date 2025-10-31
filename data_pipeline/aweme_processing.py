@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ Record = Dict[str, Any]
 # Column constants
 AWEME_ID_COLUMN = "aweme_id"
 PLAY_COUNT_COLUMN = "statistics.play_count"
+PLAY_COUNT_NESTED_PARENT = "statistics"
+PLAY_COUNT_NESTED_CHILD = "play_count"
 
 
 class QueuePublisher(Protocol):
@@ -42,12 +45,45 @@ class JsonlQueuePublisher:
 
 
 def _ensure_required_columns(records: Sequence[Record]) -> None:
-    missing_columns = {AWEME_ID_COLUMN, PLAY_COUNT_COLUMN}
-    available = set().union(*(record.keys() for record in records)) if records else set()
-    missing = missing_columns - available
-    if missing:
-        missing_list = ", ".join(sorted(missing))
+    if not records:
+        return
+
+    missing_aweme_id = any(AWEME_ID_COLUMN not in record for record in records)
+    missing_play_count = any(not _has_play_count(record) for record in records)
+
+    if missing_aweme_id or missing_play_count:
+        missing: List[str] = []
+        if missing_aweme_id:
+            missing.append(AWEME_ID_COLUMN)
+        if missing_play_count:
+            missing.append(
+                f"{PLAY_COUNT_COLUMN} or {PLAY_COUNT_NESTED_PARENT}.{PLAY_COUNT_NESTED_CHILD}"
+            )
+        missing_list = ", ".join(missing)
         raise KeyError(f"Missing required columns: {missing_list}")
+
+
+def _has_play_count(record: Record) -> bool:
+    if PLAY_COUNT_COLUMN in record:
+        return True
+    statistics = record.get(PLAY_COUNT_NESTED_PARENT)
+    if isinstance(statistics, dict) and PLAY_COUNT_NESTED_CHILD in statistics:
+        return True
+    return False
+
+
+def _extract_play_count(record: Record) -> int:
+    if PLAY_COUNT_COLUMN in record:
+        return _to_int(record[PLAY_COUNT_COLUMN])
+
+    statistics = record.get(PLAY_COUNT_NESTED_PARENT)
+    if isinstance(statistics, dict) and PLAY_COUNT_NESTED_CHILD in statistics:
+        return _to_int(statistics[PLAY_COUNT_NESTED_CHILD])
+
+    raise KeyError(
+        f"Missing play count; expected {PLAY_COUNT_COLUMN} or "
+        f"{PLAY_COUNT_NESTED_PARENT}.{PLAY_COUNT_NESTED_CHILD}"
+    )
 
 
 def _to_int(value: Any) -> int:
@@ -84,8 +120,6 @@ def load_curated_table(path: Path | str) -> List[Record]:
         )
 
     _ensure_required_columns(records)
-    for record in records:
-        record[PLAY_COUNT_COLUMN] = _to_int(record[PLAY_COUNT_COLUMN])
     return records
 
 
@@ -99,13 +133,15 @@ def select_top_aweme_by_play_count(records: Sequence[Record]) -> List[Record]:
     best_records: Dict[str, Record] = {}
     for record in records:
         aweme_id = record[AWEME_ID_COLUMN]
-        play_count = _to_int(record[PLAY_COUNT_COLUMN])
+        play_count = _extract_play_count(record)
         existing = best_records.get(aweme_id)
-        if existing is None or play_count > _to_int(existing[PLAY_COUNT_COLUMN]):
-            best_records[aweme_id] = dict(record)
+        if existing is None or play_count > _extract_play_count(existing):
+            best_records[aweme_id] = copy.deepcopy(record)
 
     deduplicated = list(best_records.values())
-    deduplicated.sort(key=lambda row: (-_to_int(row[PLAY_COUNT_COLUMN]), row[AWEME_ID_COLUMN]))
+    deduplicated.sort(
+        key=lambda row: (-_extract_play_count(row), row[AWEME_ID_COLUMN])
+    )
     return deduplicated
 
 
@@ -122,8 +158,8 @@ def partition_by_play_count(
     filtered: List[Record] = []
 
     for record in records:
-        target = accepted if _to_int(record[PLAY_COUNT_COLUMN]) >= threshold else filtered
-        target.append(dict(record))
+        target = accepted if _extract_play_count(record) >= threshold else filtered
+        target.append(copy.deepcopy(record))
 
     return accepted, filtered
 
@@ -146,7 +182,13 @@ def _write_records(records: Sequence[Record], path: Path | str) -> None:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             for record in records:
-                writer.writerow(record)
+                serialised = {
+                    key: json.dumps(value, ensure_ascii=False)
+                    if isinstance(value, (dict, list))
+                    else value
+                    for key, value in record.items()
+                }
+                writer.writerow(serialised)
     elif suffix in {".jsonl", ".ndjson"}:
         with destination.open("w", encoding="utf-8") as handle:
             for record in records:
