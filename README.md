@@ -25,6 +25,33 @@ python -m data_pipeline.aweme_processing curated.csv accepted.csv filtered.csv q
 Input and output formats are inferred from file extensions: `.csv`, `.jsonl`,
 or `.ndjson`.
 
+### Working with AWS S3
+
+All pipeline paths also accept `s3://bucket/key` URIs, letting you operate on
+the curated datasets that Apify delivered into your S3 bucket. The command
+below reads a curated table from S3, writes the accepted/filtered partitions
+back to S3, and publishes the accepted rows into an NLP queue file that also
+lives in S3:
+
+```bash
+python -m data_pipeline.aweme_processing \
+  s3://aweme-curated/input/2024-07-11.jsonl \
+  s3://aweme-curated/processed/2024-07-11.accepted.jsonl \
+  s3://aweme-curated/processed/2024-07-11.filtered.jsonl \
+  s3://aweme-curated/queues/2024-07-11.queue.jsonl \
+  --threshold 50000
+```
+
+Authenticate with AWS using any mechanism supported by `boto3` (environment
+variables, IAM role in Codespaces, AWS SSO, etc.). The CLI automatically keeps
+the highest `statistics.play_count` per `aweme_id`, writes both audit-friendly
+and accepted tables, and ensures the queue output retains each record’s full
+JSON payload for downstream NLP enrichment.
+
+> **Note:** Install `boto3` in the environment where you run the pipeline:
+> `pip install boto3`. Without it, the CLI falls back to local filesystem mode
+> and raises a helpful error if an `s3://` path is supplied.
+
 ### Troubleshooting: `ModuleNotFoundError` for `data_pipeline`
 
 If the CLI command reports that `data_pipeline` cannot be imported, double check

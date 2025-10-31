@@ -1,9 +1,12 @@
 import csv
+import io
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+import data_pipeline.aweme_processing as aweme_processing
 from data_pipeline.aweme_processing import (
     JsonlQueuePublisher,
     PLAY_COUNT_COLUMN,
@@ -57,6 +60,70 @@ def _write_jsonl(path: Path, records):
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+class _FakeStreamingBody:
+    def __init__(self, payload: str):
+        self._buffer = io.BytesIO(payload.encode("utf-8"))
+
+    def read(self) -> bytes:
+        return self._buffer.read()
+
+    def close(self) -> None:
+        self._buffer.close()
+
+
+class _FakeS3Client:
+    def __init__(self) -> None:
+        self._expected_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def add_get_object(self, *, bucket: str, key: str, payload: str) -> None:
+        self._expected_calls.append(
+            ("get_object", {"Bucket": bucket, "Key": key, "payload": payload})
+        )
+
+    def add_put_object(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        payload: str,
+        content_type: str,
+    ) -> None:
+        self._expected_calls.append(
+            (
+                "put_object",
+                {
+                    "Bucket": bucket,
+                    "Key": key,
+                    "payload": payload,
+                    "ContentType": content_type,
+                },
+            )
+        )
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+        assert self._expected_calls, "No expected S3 calls configured"
+        name, params = self._expected_calls.pop(0)
+        assert name == "get_object"
+        assert params["Bucket"] == Bucket
+        assert params["Key"] == Key
+        return {"Body": _FakeStreamingBody(params["payload"])}
+
+    def put_object(
+        self, *, Bucket: str, Key: str, Body: bytes, ContentType: str
+    ) -> dict[str, Any]:
+        assert self._expected_calls, "No expected S3 calls configured"
+        name, params = self._expected_calls.pop(0)
+        assert name == "put_object"
+        assert params["Bucket"] == Bucket
+        assert params["Key"] == Key
+        assert params["ContentType"] == ContentType
+        assert Body == params["payload"].encode("utf-8")
+        return {}
+
+    def assert_no_pending(self) -> None:
+        assert not self._expected_calls
 
 
 def test_process_curated_table_writes_outputs(tmp_path: Path):
@@ -152,3 +219,78 @@ def test_process_curated_table_preserves_full_json_record(tmp_path: Path):
     assert accepted_disk == accepted == [raw_records[1], raw_records[2]]
     assert filtered_disk == filtered == []
     assert queue_disk == accepted_disk
+
+
+def test_load_curated_table_from_s3(monkeypatch):
+    client = _FakeS3Client()
+
+    records = [
+        {AWEME_ID_COLUMN: "1", "statistics": {"play_count": 60_000}},
+        {AWEME_ID_COLUMN: "2", "statistics": {"play_count": 10_000}},
+    ]
+    payload = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    client.add_get_object(bucket="bucket", key="path/curated.jsonl", payload=payload)
+    monkeypatch.setattr(aweme_processing, "_get_s3_client", lambda: client)
+
+    loaded = aweme_processing.load_curated_table("s3://bucket/path/curated.jsonl")
+
+    client.assert_no_pending()
+
+    assert loaded == records
+
+
+def test_process_curated_table_with_s3(monkeypatch):
+    client = _FakeS3Client()
+
+    source_records = [
+        {AWEME_ID_COLUMN: "1", "statistics": {"play_count": 20_000}, "caption": "low"},
+        {AWEME_ID_COLUMN: "1", "statistics": {"play_count": 80_000}, "caption": "high"},
+        {AWEME_ID_COLUMN: "2", "statistics": {"play_count": 60_000}, "caption": "ok"},
+        {AWEME_ID_COLUMN: "3", "statistics": {"play_count": 40_000}, "caption": "nope"},
+    ]
+    source_payload = "".join(
+        json.dumps(record, ensure_ascii=False) + "\n" for record in source_records
+    )
+    client.add_get_object(bucket="bucket", key="input/curated.jsonl", payload=source_payload)
+
+    accepted_expected = [source_records[1], source_records[2]]
+    filtered_expected = [source_records[3]]
+    accepted_payload = "".join(
+        json.dumps(record, ensure_ascii=False) + "\n" for record in accepted_expected
+    )
+    filtered_payload = "".join(
+        json.dumps(record, ensure_ascii=False) + "\n" for record in filtered_expected
+    )
+
+    client.add_put_object(
+        bucket="bucket",
+        key="output/accepted.jsonl",
+        payload=accepted_payload,
+        content_type="application/json",
+    )
+    client.add_put_object(
+        bucket="bucket",
+        key="output/filtered.jsonl",
+        payload=filtered_payload,
+        content_type="application/json",
+    )
+    client.add_put_object(
+        bucket="bucket",
+        key="output/queue.jsonl",
+        payload=accepted_payload,
+        content_type="application/json",
+    )
+    monkeypatch.setattr(aweme_processing, "_get_s3_client", lambda: client)
+
+    publisher = JsonlQueuePublisher("s3://bucket/output/queue.jsonl", append=False)
+    accepted, filtered = process_curated_table(
+        "s3://bucket/input/curated.jsonl",
+        accepted_output="s3://bucket/output/accepted.jsonl",
+        filtered_output="s3://bucket/output/filtered.jsonl",
+        queue_publisher=publisher,
+    )
+
+    client.assert_no_pending()
+
+    assert accepted == accepted_expected
+    assert filtered == filtered_expected

@@ -4,10 +4,30 @@ from __future__ import annotations
 
 import copy
 import csv
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Protocol, Sequence, Tuple
+
+try:  # pragma: no cover - optional dependency setup
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # pragma: no cover - fallback for environments without boto3
+    boto3 = None  # type: ignore[assignment]
+
+    class ClientError(Exception):
+        def __init__(
+            self,
+            error_response: Dict[str, Any] | None = None,
+            operation_name: str | None = None,
+        ):
+            self.response = error_response or {"Error": {}}
+            self.operation_name = operation_name
+            super().__init__(str(self.response))
+
+    class BotoCoreError(Exception):
+        pass
 
 Record = Dict[str, Any]
 
@@ -29,19 +49,35 @@ class QueuePublisher(Protocol):
 class JsonlQueuePublisher:
     """Simple queue publisher that appends JSONL rows to a file."""
 
-    destination: Path
+    destination: Path | str
     append: bool = True
 
     def publish(self, records: Iterable[Record]) -> None:  # pragma: no cover - simple wrapper
         rows = list(records)
         if not rows:
             return
+        if _is_s3_path(self.destination):
+            self._publish_to_s3(rows)
+            return
 
-        self.destination.parent.mkdir(parents=True, exist_ok=True)
-        mode = "a" if self.append and self.destination.exists() else "w"
-        with self.destination.open(mode, encoding="utf-8") as handle:
+        destination = Path(self.destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        mode = "a" if self.append and destination.exists() else "w"
+        with destination.open(mode, encoding="utf-8") as handle:
             for row in rows:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _publish_to_s3(self, rows: List[Record]) -> None:
+        uri = str(self.destination)
+        existing = ""
+        if self.append:
+            try:
+                existing = _read_text_from_s3(uri)
+            except FileNotFoundError:
+                existing = ""
+        new_payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+        payload = existing + new_payload
+        _write_text_to_s3(uri, payload, ".jsonl")
 
 
 def _ensure_required_columns(records: Sequence[Record]) -> None:
@@ -102,22 +138,27 @@ def _to_int(value: Any) -> int:
 def load_curated_table(path: Path | str) -> List[Record]:
     """Load the curated dataset from CSV or JSON Lines files."""
 
-    resolved = Path(path)
-    if not resolved.exists():
-        raise FileNotFoundError(f"Curated table not found: {resolved}")
-
-    suffix = resolved.suffix.lower()
-    if suffix == ".csv":
-        with resolved.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            records = [dict(row) for row in reader]
-    elif suffix in {".jsonl", ".ndjson"}:
-        with resolved.open("r", encoding="utf-8") as handle:
-            records = [json.loads(line) for line in handle if line.strip()]
+    if _is_s3_path(path):
+        suffix = Path(_parse_s3_uri(str(path))[1]).suffix.lower()
+        raw_text = _read_text_from_s3(str(path))
+        records = _deserialise_records(raw_text, suffix)
     else:
-        raise ValueError(
-            "Unsupported file extension for curated table: " f"{resolved.suffix}"
-        )
+        resolved = Path(path)
+        if not resolved.exists():
+            raise FileNotFoundError(f"Curated table not found: {resolved}")
+
+        suffix = resolved.suffix.lower()
+        if suffix == ".csv":
+            with resolved.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                records = [dict(row) for row in reader]
+        elif suffix in {".jsonl", ".ndjson"}:
+            with resolved.open("r", encoding="utf-8") as handle:
+                records = [json.loads(line) for line in handle if line.strip()]
+        else:
+            raise ValueError(
+                "Unsupported file extension for curated table: " f"{resolved.suffix}"
+            )
 
     _ensure_required_columns(records)
     return records
@@ -165,10 +206,21 @@ def partition_by_play_count(
 
 
 def _write_records(records: Sequence[Record], path: Path | str) -> None:
+    suffix = _infer_suffix(path)
+    payload = _serialise_records(records, suffix)
+
+    if _is_s3_path(path):
+        _write_text_to_s3(str(path), payload, suffix)
+        return
+
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    suffix = destination.suffix.lower()
+    newline = "" if suffix == ".csv" else None
+    with destination.open("w", encoding="utf-8", newline=newline) as handle:
+        handle.write(payload)
 
+
+def _serialise_records(records: Sequence[Record], suffix: str) -> str:
     if suffix == ".csv":
         fieldnames: List[str] = []
         if records:
@@ -178,26 +230,102 @@ def _write_records(records: Sequence[Record], path: Path | str) -> None:
                     if key not in seen:
                         seen.add(key)
                         fieldnames.append(key)
-        with destination.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            for record in records:
-                serialised = {
-                    key: json.dumps(value, ensure_ascii=False)
-                    if isinstance(value, (dict, list))
-                    else value
-                    for key, value in record.items()
-                }
-                writer.writerow(serialised)
-    elif suffix in {".jsonl", ".ndjson"}:
-        with destination.open("w", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    else:
-        raise ValueError(
-            "Unsupported file extension for output: " f"{destination.suffix}"
-        )
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            serialised = {
+                key: json.dumps(value, ensure_ascii=False)
+                if isinstance(value, (dict, list))
+                else value
+                for key, value in record.items()
+            }
+            writer.writerow(serialised)
+        return buffer.getvalue()
+    if suffix in {".jsonl", ".ndjson"}:
+        return "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    raise ValueError(f"Unsupported file extension for output: {suffix}")
 
+
+def _deserialise_records(raw_text: str, suffix: str) -> List[Record]:
+    if suffix == ".csv":
+        buffer = io.StringIO(raw_text)
+        reader = csv.DictReader(buffer)
+        return [dict(row) for row in reader]
+    if suffix in {".jsonl", ".ndjson"}:
+        return [json.loads(line) for line in raw_text.splitlines() if line.strip()]
+    raise ValueError(f"Unsupported file extension for curated table: {suffix}")
+
+
+def _infer_suffix(path: Path | str) -> str:
+    if _is_s3_path(path):
+        return Path(_parse_s3_uri(str(path))[1]).suffix.lower()
+    return Path(path).suffix.lower()
+
+
+def _is_s3_path(path: Path | str) -> bool:
+    value = str(path)
+    return value.startswith("s3://") or value.startswith("s3:/")
+
+
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    if uri.startswith("s3://"):
+        without_scheme = uri[5:]
+    elif uri.startswith("s3:/"):
+        without_scheme = uri[4:]
+        if without_scheme.startswith("/"):
+            without_scheme = without_scheme[1:]
+    else:
+        raise ValueError(f"Invalid S3 URI: {uri}")
+    if not without_scheme:
+        raise ValueError(f"Invalid S3 URI: {uri}")
+    parts = without_scheme.split("/", 1)
+    bucket = parts[0]
+    if len(parts) == 1 or not parts[1]:
+        raise ValueError(f"S3 URI is missing key: {uri}")
+    key = parts[1]
+    return bucket, key
+
+
+def _get_s3_client():
+    if boto3 is None:  # pragma: no cover - defensive guard for missing boto3
+        raise ModuleNotFoundError(
+            "boto3 is required for S3 operations. Install boto3 to enable s3:// support."
+        )
+    return boto3.client("s3")
+
+
+def _read_text_from_s3(uri: str) -> str:
+    bucket, key = _parse_s3_uri(uri)
+    client = _get_s3_client()
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+    except ClientError as error:
+        code = (error.response or {}).get("Error", {}).get("Code")  # type: ignore[union-attr]
+        if code in {"NoSuchKey", "404"}:
+            raise FileNotFoundError(f"S3 object not found: {uri}") from error
+        raise
+    body = response["Body"]
+    data = body.read()
+    close = getattr(body, "close", None)
+    if callable(close):
+        close()
+    return data.decode("utf-8")
+
+
+def _write_text_to_s3(uri: str, payload: str, suffix: str) -> None:
+    bucket, key = _parse_s3_uri(uri)
+    client = _get_s3_client()
+    content_type = "application/json" if suffix in {".jsonl", ".ndjson"} else "text/csv"
+    try:
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=payload.encode("utf-8"),
+            ContentType=content_type,
+        )
+    except (ClientError, BotoCoreError) as error:
+        raise RuntimeError(f"Failed to write to S3 object {uri}: {error}") from error
 
 def process_curated_table(
     input_path: Path | str,
@@ -224,21 +352,21 @@ def main() -> None:  # pragma: no cover - CLI wrapper
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input_path", type=Path, help="Path to the curated input table")
+    parser.add_argument("input_path", type=str, help="Path or s3 URI to the curated input table")
     parser.add_argument(
         "accepted_output",
-        type=Path,
-        help="Path where the accepted rows will be persisted",
+        type=str,
+        help="Path or s3 URI where the accepted rows will be persisted",
     )
     parser.add_argument(
         "filtered_output",
-        type=Path,
-        help="Path where the filtered rows (<threshold) will be persisted",
+        type=str,
+        help="Path or s3 URI where the filtered rows (<threshold) will be persisted",
     )
     parser.add_argument(
         "queue_path",
-        type=Path,
-        help="JSONL file acting as the NLP processing queue",
+        type=str,
+        help="Path or s3 URI for the JSONL NLP processing queue",
     )
     parser.add_argument(
         "--threshold",
