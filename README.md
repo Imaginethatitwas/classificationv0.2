@@ -25,6 +25,21 @@ python -m data_pipeline.aweme_processing curated.csv accepted.csv filtered.csv q
 Input and output formats are inferred from file extensions: `.csv`, `.jsonl`,
 or `.ndjson`.
 
+### Troubleshooting: `ModuleNotFoundError` for `data_pipeline`
+
+If the CLI command reports that `data_pipeline` cannot be imported, double check
+that your workspace contains the package directory:
+
+```bash
+ls
+```
+
+You should see a `data_pipeline/` folder. If it is missing, pull the latest
+branch contents (e.g. `git fetch origin` followed by `git pull origin
+group-and-filter-records-by-play-count`) or recreate the Codespace from the
+updated branch so that the package files are available on disk. Once the folder
+is present, rerunning the command from the repository root should succeed.
+
 ## Testing
 
 ```bash
