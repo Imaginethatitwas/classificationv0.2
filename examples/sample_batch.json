@@ -1,0 +1,61 @@
+[
+  {
+    "aweme_id": "1000000000000000001",
+    "desc": "Wholesome family time with our puppy love #goodvibes",
+    "create_time": 1700000000,
+    "statistics": {
+      "play_count": 80000,
+      "comment_count": 1200,
+      "digg_count": 15000,
+      "share_count": 300
+    },
+    "text_extra": [
+      {"hashtag_name": "goodvibes"},
+      {"hashtag_name": "familytime"}
+    ]
+  },
+  {
+    "aweme_id": "1000000000000000002",
+    "desc": "Trigger warning: this scam is dangerous and full of hate",
+    "create_time": 1700000600,
+    "statistics": {
+      "play_count": 125000,
+      "comment_count": 5200,
+      "digg_count": 18000,
+      "share_count": 950
+    },
+    "text_extra": [
+      {"hashtag_name": "scamalert"}
+    ]
+  },
+  {
+    "aweme_id": "1000000000000000003",
+    "desc": "Storytime drama where we spill the receipts on the liar",
+    "create_time": 1700001200,
+    "statistics": {
+      "play_count": 64000,
+      "comment_count": 2100,
+      "digg_count": 9000,
+      "share_count": 400
+    },
+    "text_extra": [
+      {"hashtag_name": "drama"},
+      {"hashtag_name": "storytime"}
+    ]
+  },
+  {
+    "aweme_id": "1000000000000000004",
+    "desc": "Surreal backrooms drama where we spill the tea on this feud",
+    "create_time": 1700001800,
+    "statistics": {
+      "play_count": 91000,
+      "comment_count": 1800,
+      "digg_count": 14000,
+      "share_count": 650
+    },
+    "text_extra": [
+      {"hashtag_name": "weirdcore"},
+      {"hashtag_name": "tea"}
+    ]
+  }
+]
