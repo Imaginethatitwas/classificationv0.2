@@ -50,3 +50,20 @@ The scaffolding is intentionally modular. Replace the rule-based
 `detect_signals` function with the spaCy `textcat_multilabel` model once
 it has been trained, and plug your learned secondary classifiers into the
 hooks inside `logic.ConflictResolver` as they become available.
+
+## Documentation & smoke tests
+
+* See `docs/IMPLEMENTATION_GUIDE.md` for a detailed walkthrough of how to
+  connect the S3 ingestion flow, wire the CLI into your orchestrator, and swap
+  in trained NLP models.
+* See `docs/TESTING.md` for validation procedures, including the bundled smoke
+  test.
+* To run the smoke test locally, execute:
+
+  ```bash
+  python scripts/smoke_test.py
+  ```
+
+  This verifies that the sample dataset in `examples/sample_batch.json` can be
+  processed end-to-end and that the logic layer emits the expected
+  classifications and market buckets.
