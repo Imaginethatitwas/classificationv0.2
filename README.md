@@ -25,11 +25,18 @@ Install the package in editable mode:
 python -m pip install -e .
 ```
 
-Run the pipeline over a directory of curated JSON/CSV exports:
+Run the pipeline over a directory of curated JSON/CSV exports (local paths or
+an S3 prefix/object):
 
 ```bash
 classification-pipeline ./path/to/acceptances_full --output ./outputs --min-views 50000
+# or read directly from S3
+classification-pipeline s3://your-bucket/curated/acceptances_full/ --output ./outputs
 ```
+
+When pointing at S3 URIs, ensure the environment has AWS credentials with read
+access to the bucket; the pipeline uses `boto3` under the hood and will stream
+JSON/CSV objects directly without a manual sync step.
 
 The command produces two artefacts inside `./outputs`:
 
